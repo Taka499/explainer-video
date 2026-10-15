@@ -89,6 +89,13 @@ def root(tmp_path):
     return home
 
 
+@pytest.fixture
+def work(root):
+    directory = root / "video"
+    directory.mkdir()
+    return directory
+
+
 def write_narration(directory, segments):
     path = directory / "narration.json"
     path.write_text(json.dumps({"language": "en", "segments": segments}))
@@ -245,8 +252,8 @@ def test_check_reports_missing_key_and_voice(tmp_path, capsys, monkeypatch):
 # ---------- synthesize ----------
 
 
-def test_first_run_synthesizes_and_writes_manifest(root, tmp_path, capsys):
-    narration = write_narration(tmp_path, SEGMENTS)
+def test_first_run_synthesizes_and_writes_manifest(root, work, capsys):
+    narration = write_narration(work, SEGMENTS)
     runner, opener = FakeRunner(), FakeOpener()
     summary = tts.synthesize(narration, root, run=runner, opener=opener, sleep=refuse, sandboxed=False)
 
@@ -257,7 +264,7 @@ def test_first_run_synthesizes_and_writes_manifest(root, tmp_path, capsys):
     assert request.full_url == ("https://api.elevenlabs.io/v1/text-to-speech/voice123/with-timestamps"
                                 "?output_format=mp3_44100_128")
     assert request.get_header("Xi-api-key") == KEY
-    manifest = json.loads((tmp_path / "voice_manifest.json").read_text())
+    manifest = json.loads((work / "voice_manifest.json").read_text())
     first = manifest["segments"][0]
     assert first["id"] == "s01" and first["duration"] == 1.25
     assert open(first["audio"], "rb").read() == b"MP3:" + SEGMENTS[0]["text"].encode()
@@ -265,32 +272,32 @@ def test_first_run_synthesizes_and_writes_manifest(root, tmp_path, capsys):
     assert KEY not in capsys.readouterr().out
 
 
-def test_second_run_is_free(root, tmp_path):
-    narration = write_narration(tmp_path, SEGMENTS)
+def test_second_run_is_free(root, work):
+    narration = write_narration(work, SEGMENTS)
     tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
     summary = tts.synthesize(narration, root, run=refuse, opener=refuse, sandboxed=True)
     assert summary["cached"] == 2 and summary["billed_characters"] == 0
 
 
-def test_only_the_changed_segment_is_synthesized(root, tmp_path):
-    narration = write_narration(tmp_path, SEGMENTS)
+def test_only_the_changed_segment_is_synthesized(root, work):
+    narration = write_narration(work, SEGMENTS)
     tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
-    write_narration(tmp_path, [SEGMENTS[0], {"id": "s02", "text": "Slopes, nearly everywhere."}])
+    write_narration(work, [SEGMENTS[0], {"id": "s02", "text": "Slopes, nearly everywhere."}])
     opener = FakeOpener()
     assert tts.synthesize(narration, root, run=FakeRunner(), opener=opener, sandboxed=False)["synthesized"] == 1
     assert len(opener.requests) == 1
 
 
-def test_incomplete_cache_entry_is_redone(root, tmp_path):
-    narration = write_narration(tmp_path, SEGMENTS[:1])
+def test_incomplete_cache_entry_is_redone(root, work):
+    narration = write_narration(work, SEGMENTS[:1])
     tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
     for timing in (root / ".cache" / "tts").glob("*.json"):
         timing.unlink()
     assert tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)["synthesized"] == 1
 
 
-def test_sandboxed_run_with_uncached_segments_explains_itself(root, tmp_path):
-    narration = write_narration(tmp_path, SEGMENTS)
+def test_sandboxed_run_with_uncached_segments_explains_itself(root, work):
+    narration = write_narration(work, SEGMENTS)
     with pytest.raises(tts.UserError, match="dangerouslyDisableSandbox"):
         tts.synthesize(narration, root, run=refuse, opener=refuse, sandboxed=True)
 
@@ -300,29 +307,123 @@ def test_relative_narration_path_is_rejected(root):
         tts.synthesize(tts.Path("narration.json"), root, run=refuse, opener=refuse, sandboxed=False)
 
 
-def test_missing_key_stops_before_any_request(root, tmp_path):
-    narration = write_narration(tmp_path, SEGMENTS)
+def test_missing_key_stops_before_any_request(root, work):
+    narration = write_narration(work, SEGMENTS)
     with pytest.raises(tts.UserError, match="missing"):
         tts.synthesize(narration, root, run=FakeRunner(key_status=44), opener=refuse, sandboxed=False)
 
 
-def test_rate_limit_is_retried_once_after_retry_after(root, tmp_path):
-    narration = write_narration(tmp_path, SEGMENTS[:1])
+def test_rate_limit_is_retried_once_after_retry_after(root, work):
+    narration = write_narration(work, SEGMENTS[:1])
     slept, opener = [], FakeOpener(errors=[http_error(429, headers={"Retry-After": "2"})])
     tts.synthesize(narration, root, run=FakeRunner(), opener=opener, sleep=slept.append, sandboxed=False)
     assert slept == [2.0] and len(opener.requests) == 2
 
 
-def test_second_failure_is_reported(root, tmp_path):
-    narration = write_narration(tmp_path, SEGMENTS[:1])
+def test_second_failure_is_reported(root, work):
+    narration = write_narration(work, SEGMENTS[:1])
     opener = FakeOpener(errors=[http_error(503), http_error(503)])
     with pytest.raises(tts.UserError, match="HTTP 503"):
         tts.synthesize(narration, root, run=FakeRunner(), opener=opener, sleep=lambda s: None, sandboxed=False)
 
 
-def test_auth_error_is_not_retried_and_hides_the_key(root, tmp_path):
-    narration = write_narration(tmp_path, SEGMENTS[:1])
+def test_auth_error_is_not_retried_and_hides_the_key(root, work):
+    narration = write_narration(work, SEGMENTS[:1])
     opener = FakeOpener(errors=[http_error(401, b'{"detail": {"status": "invalid_api_key"}}')])
     with pytest.raises(tts.UserError) as info:
         tts.synthesize(narration, root, run=FakeRunner(), opener=opener, sleep=refuse, sandboxed=False)
     assert "401" in str(info.value) and KEY not in str(info.value) and len(opener.requests) == 1
+
+
+# ---------- writes never follow links (tts.py runs outside the sandbox) ----------
+
+
+def test_narration_outside_the_output_root_is_refused(root, tmp_path):
+    narration = write_narration(tmp_path, SEGMENTS)
+    with pytest.raises(tts.UserError, match="outside"):
+        tts.synthesize(narration, root, run=refuse, opener=refuse, sandboxed=False)
+    assert not (tmp_path / "voice_manifest.json").exists()
+
+
+def test_work_directory_linked_outside_the_root_is_refused(root, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write_narration(outside, SEGMENTS)
+    (root / "linked").symlink_to(outside)
+    with pytest.raises(tts.UserError, match="outside"):
+        tts.synthesize(root / "linked" / "narration.json", root, run=refuse, opener=refuse, sandboxed=False)
+    assert not (outside / "voice_manifest.json").exists()
+
+
+def test_cache_directory_replaced_by_a_link_is_refused(root, work, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".cache").mkdir()
+    (root / ".cache" / "tts").symlink_to(outside)
+    narration = write_narration(work, SEGMENTS)
+    with pytest.raises(tts.UserError):
+        tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
+    assert list(outside.iterdir()) == []
+
+
+def test_link_inside_the_root_to_another_root_directory_is_followed_safely(root, work):
+    (root / "alias").symlink_to(work)
+    write_narration(work, SEGMENTS)
+    tts.synthesize(root / "alias" / "narration.json", root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
+    assert (work / "voice_manifest.json").is_file()
+
+
+def test_planted_link_at_the_manifest_is_replaced_not_followed(root, work, tmp_path):
+    victim = tmp_path / "settings.json"
+    victim.write_text("original")
+    (work / "voice_manifest.json").symlink_to(victim)
+    tts.synthesize(write_narration(work, SEGMENTS), root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
+    assert victim.read_text() == "original"
+    assert not (work / "voice_manifest.json").is_symlink()
+
+
+def test_planted_links_in_the_cache_are_not_trusted_or_followed(root, work, tmp_path):
+    narration = write_narration(work, SEGMENTS[:1])
+    tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
+    cache = root / ".cache" / "tts"
+    victim = tmp_path / "victim.json"
+    victim.write_text(json.dumps({"duration": 99}))
+    for timing in cache.glob("*.json"):
+        timing.unlink()
+        timing.symlink_to(victim)
+    summary = tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
+    assert summary["synthesized"] == 1
+    assert json.loads(victim.read_text()) == {"duration": 99}
+    assert not any(p.is_symlink() for p in cache.iterdir())
+    assert not any(p.name.endswith(".part") for p in cache.iterdir())
+
+
+def test_link_swapped_in_after_the_path_check_is_still_refused(root, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".cache").mkdir()
+    (root / ".cache" / "tts").symlink_to(outside)
+    # As if the link appeared between realpath() and the walk: the walk alone must refuse it.
+    monkeypatch.setattr(tts.os.path, "realpath", lambda p: str(p))
+    with pytest.raises(tts.UserError, match="symlink"):
+        tts.SafeDir.open(root, root / ".cache" / "tts")
+
+
+def test_link_planted_at_the_old_fixed_temp_name_is_left_alone(root, work, tmp_path):
+    victim = tmp_path / "zshrc"
+    victim.write_text("original")
+    (work / "voice_manifest.json.part").symlink_to(victim)
+    tts.synthesize(write_narration(work, SEGMENTS), root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
+    assert victim.read_text() == "original"
+
+
+def test_planted_link_in_place_of_cached_audio_is_resynthesized(root, work, tmp_path):
+    narration = write_narration(work, SEGMENTS[:1])
+    tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)
+    victim = tmp_path / "victim.bin"
+    victim.write_bytes(b"secret")
+    for audio in (root / ".cache" / "tts").glob("*.mp3"):
+        audio.unlink()
+        audio.symlink_to(victim)
+    assert tts.synthesize(narration, root, run=FakeRunner(), opener=FakeOpener(), sandboxed=False)["synthesized"] == 1
+    assert victim.read_bytes() == b"secret"

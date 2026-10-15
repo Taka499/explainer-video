@@ -24,7 +24,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -250,20 +252,84 @@ def probe_duration(path: Path, run: Runner = subprocess.run) -> float:
         raise UserError(f"ffprobe could not read the duration of {path}: {result.stderr.strip()}") from None
 
 
-def write_atomic(path: Path, data: bytes) -> None:
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+class SafeDir:
+    """A directory under the output root, opened one component at a time without following symlinks.
+
+    tts.py runs outside the sandbox, yet it writes where sandboxed commands can plant links.
+    Every write therefore goes through this pinned descriptor. A link at any level is refused,
+    and temp files get unpredictable names created with O_EXCL. A planted link can never
+    redirect a write outside the output root. The root itself is trusted: its parent
+    (~/Movies) is not writable inside the sandbox, so the root cannot be swapped for a link.
+    """
+
+    def __init__(self, fd: int, path: Path):
+        self.fd, self.path = fd, path
+
+    @classmethod
+    def open(cls, root: Path, directory: Path, create: bool = False) -> "SafeDir":
+        root_real = Path(os.path.realpath(root))
+        real = Path(os.path.realpath(directory))
+        try:
+            parts = real.relative_to(root_real).parts
+        except ValueError:
+            raise UserError(f"{directory} is outside {root_real}; tts.py writes only under the output root") from None
+        fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parts:
+                if create:
+                    try:
+                        os.mkdir(part, 0o755, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+        except OSError as exc:
+            os.close(fd)
+            raise UserError(f"refusing to write in {directory}: {exc.strerror} at {part!r} "
+                            "(a symlink, or not a directory)") from None
+        return cls(fd, real)
+
+    def __enter__(self) -> "SafeDir":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        os.close(self.fd)
+
+    def is_file(self, name: str) -> bool:
+        try:
+            return stat.S_ISREG(os.stat(name, dir_fd=self.fd, follow_symlinks=False).st_mode)
+        except OSError:
+            return False
+
+    def read(self, name: str) -> bytes:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        with os.fdopen(fd, "rb") as f:
+            return f.read()
+
+    def write(self, name: str, data: bytes) -> None:
+        """Write a temp file, then rename it over `name`. The rename replaces a link there, never follows it."""
+        tmp = f".{name}.{secrets.token_hex(8)}.part"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=self.fd)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
 
 
-def cached_entry(cache_dir: Path, key: str) -> Optional[dict]:
+def cached_entry(cache: SafeDir, key: str) -> Optional[dict]:
     """The timing record, if both files exist; the JSON is written last and marks the entry complete."""
-    timing, audio = cache_dir / f"{key}.json", cache_dir / f"{key}.mp3"
-    if not (timing.is_file() and audio.is_file()):
+    if not (cache.is_file(f"{key}.json") and cache.is_file(f"{key}.mp3")):
         return None
     try:
-        return json.loads(timing.read_text(encoding="utf-8"))
-    except ValueError:
+        return json.loads(cache.read(f"{key}.json").decode("utf-8"))
+    except (OSError, ValueError):
         return None
 
 
@@ -280,16 +346,24 @@ def synthesize(narration_path: Path, root: Path, *, run: Runner = subprocess.run
         raise UserError(f"cannot read {narration_path}: {exc}") from exc
     segments = parse_narration(raw)
     config = load_config(root)
-    cache_dir = root / ".cache" / "tts"
-    cache_dir.mkdir(parents=True, exist_ok=True)
     sandboxed = in_sandbox() if sandboxed is None else sandboxed
+    with SafeDir.open(root, narration_path.parent) as workdir, \
+            SafeDir.open(root, root / ".cache" / "tts", create=True) as cache:
+        summary = _synthesize_into(segments, raw, config, workdir, cache, run=run, opener=opener,
+                                   sleep=sleep, sandboxed=sandboxed, out=out)
+    print(json.dumps(summary, ensure_ascii=False), file=out)
+    return summary
 
+
+def _synthesize_into(segments: list[Segment], raw: dict, config: Config, workdir: SafeDir, cache: SafeDir,
+                     *, run: Runner, opener: Callable[..., Any], sleep: Callable[[float], None],
+                     sandboxed: bool, out) -> dict:
     key: Optional[str] = None
     entries, new, billed = [], 0, 0
     for seg in segments:
         body = request_body(seg.text, config)
         digest = cache_key(config, body)
-        entry = cached_entry(cache_dir, digest)
+        entry = cached_entry(cache, digest)
         state = "cached"
         if entry is None:
             if key is None:
@@ -299,37 +373,32 @@ def synthesize(narration_path: Path, root: Path, *, run: Runner = subprocess.run
                 key = read_key(run)
             payload, headers = post_tts(key, config, body, opener=opener, sleep=sleep)
             audio, alignment, source = parse_response(payload)
-            audio_path = cache_dir / f"{digest}.mp3"
-            write_atomic(audio_path, audio)
+            cache.write(f"{digest}.mp3", audio)
             cost = billed_characters(headers, seg.text)
             entry = {
                 "key": digest, "text": seg.text, "voice_id": config.voice_id,
                 "model_id": config.model_id, "output_format": config.output_format,
                 "voice_settings": config.voice_settings,
-                "duration": probe_duration(audio_path, run),
+                "duration": probe_duration(cache.path / f"{digest}.mp3", run),
                 "alignment_source": source, "alignment": alignment,
                 "billed_characters": cost,
                 "request_id": {k.lower(): v for k, v in headers.items()}.get("request-id"),
             }
-            write_atomic(cache_dir / f"{digest}.json",
-                         json.dumps(entry, ensure_ascii=False, indent=1).encode("utf-8"))
+            cache.write(f"{digest}.json", json.dumps(entry, ensure_ascii=False, indent=1).encode("utf-8"))
             new += 1
             billed += cost
             state = "new"
         entries.append({"id": seg.id, "text": seg.text, "duration": entry["duration"],
-                        "audio": str(cache_dir / f"{digest}.mp3"),
-                        "timing": str(cache_dir / f"{digest}.json")})
+                        "audio": str(cache.path / f"{digest}.mp3"),
+                        "timing": str(cache.path / f"{digest}.json")})
         print(f"{seg.id:<12} {state:<7} {entry['duration']:6.2f}s", file=out)
 
     manifest = {"language": raw.get("language"), "voice_id": config.voice_id,
                 "model_id": config.model_id, "segments": entries}
-    manifest_path = narration_path.with_name("voice_manifest.json")
-    write_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"))
-    summary = {"segments": len(entries), "synthesized": new, "cached": len(entries) - new,
-               "audio_seconds": round(sum(e["duration"] for e in entries), 2),
-               "billed_characters": billed, "manifest": str(manifest_path)}
-    print(json.dumps(summary, ensure_ascii=False), file=out)
-    return summary
+    workdir.write("voice_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"))
+    return {"segments": len(entries), "synthesized": new, "cached": len(entries) - new,
+            "audio_seconds": round(sum(e["duration"] for e in entries), 2),
+            "billed_characters": billed, "manifest": str(workdir.path / "voice_manifest.json")}
 
 
 def check(root: Path, *, run: Runner = subprocess.run, sandboxed: Optional[bool] = None,

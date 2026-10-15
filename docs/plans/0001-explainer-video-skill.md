@@ -44,6 +44,13 @@
 - **The venv uses Python 3.13.** Every Manim 0.22.0 dependency has a cp313 macOS arm64 wheel except `pycairo`, which builds from source on any Python version. For the `ar` failure under Measured, `setup` exports `AR="$(xcrun --find ar)"`. Measured: inside the sandbox that command prints the right path despite its cache errors. `toolchain.sh run` points `XDG_CACHE_HOME` and `TEXMFVAR` under `.toolchain/`.
 - **`install.sh` prints two spellings of the `tts.py` allow rule**, one with the symlink path and one with its target. It is not known which one `${CLAUDE_SKILL_DIR}` expands to, so the first run will show it, and the other rule can then go.
 - **Risk of that allow rule:** it lets `tts.py` run outside the sandbox with no prompt, and its code sits in this git checkout. A background security review flagged this. The mitigation depends on the sandbox write-protecting files that a symlink in `~/.claude` points to. That is checked after install under Verification.
+- **`tts.py` never writes through a link.** A second background review found that `tts.py`, running outside the sandbox, wrote `voice_manifest.json.part` at a fixed name, in a directory sandboxed commands can write. A link planted there would have sent the write anywhere, `~/.claude/settings.json` for one. All writes now go through `SafeDir`:
+  - It refuses directories that resolve outside the output root.
+  - It walks each path component with `O_NOFOLLOW`, so a link swapped in after the check is refused as well.
+  - It creates temp files with random names and `O_EXCL`, then renames them in place. The rename replaces a planted link and never follows it.
+  - It does not treat a link in the cache as a cached segment.
+
+  Each guard has a test that fails when the guard is removed. The cost is a new restriction: `narration.json` must sit under `~/Movies/explainers`.
 
 ## Measured (2026-10-15, Darwin 25.6, uv 0.12.23, inside the Claude Code sandbox)
 

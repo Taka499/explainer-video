@@ -34,7 +34,7 @@ A Claude Code user-level skill, `explainer-video`, that turns a topic into a 3Bl
 
 - `skill/SKILL.md` runs in the main session: preflight, then the brief, then the launch of one background `general-purpose` Agent, then the report.
 - `skill/references/production.md` is the subagent's manual: storyboard → `narration.json` → `tts.py` → `scenes.py` → low-quality render and still-frame check → final render → `voice.py assemble`.
-- `skill/scripts/tts.py` uses only the standard library and must run on Apple's `/usr/bin/python3` 3.9. It reads the key from the Keychain and calls ElevenLabs `POST /v1/text-to-speech/{voice_id}/with-timestamps`. It caches `<hash>.mp3` and `<hash>.json` (character timing) under `~/Movies/explainers/.cache/tts/`, and writes `voice_manifest.json` beside the narration. It is the only command that runs outside the sandbox (per `docs/plans/0001-explainer-video-skill.md` § Decision Log).
+- `skill/scripts/tts.py` uses only the standard library and must run on Apple's `/usr/bin/python3` 3.9. It reads the key from the Keychain and calls ElevenLabs `POST /v1/text-to-speech/{voice_id}/with-timestamps`. It caches `<hash>.mp3` and `<hash>.json` (character timing) under `~/Movies/explainers/.cache/tts/`, and writes `voice_manifest.json` beside the narration. It is the only command that runs outside the sandbox (per `docs/plans/0001-explainer-video-skill.md` § Decision Log). It still writes where sandboxed commands can plant symlinks, so all of its writes go through `SafeDir`. `SafeDir` refuses any directory outside the output root, opens each path component with `O_NOFOLLOW`, creates temp files with random names and `O_EXCL`, and renames them in place. Keep every new write on that path.
 - `skill/scripts/voice.py` is copied into each work directory and imported by the scenes. `narration.say(scene, id)` adds the audio and records its start in `build/timeline/<Scene>.json`; `assemble` joins the scene files and writes the SRT from those timelines. It never imports Manim, so its rules test without it.
 - `skill/scripts/toolchain.sh` has three commands. `check` is the preflight. `setup` builds the Manim 0.22.0 venv in `~/Movies/explainers/.toolchain/venv`. `run` sets `PATH`, `XDG_CACHE_HOME` and `TEXMFVAR` so Manim and TeX work inside the sandbox.
 
@@ -54,7 +54,7 @@ After that, `/explainer-video <topic>` runs the skill.
 ## Build and Test
 
 ```bash
-UV_CACHE_DIR="$PWD/.uv-cache" uv run --group dev pytest -q      # 106 passed; needs ffmpeg for two tests
+UV_CACHE_DIR="$PWD/.uv-cache" uv run --group dev pytest -q      # 115 passed; three tests need ffmpeg
 ```
 
 Inside the sandbox, `UV_CACHE_DIR` must point somewhere writable: uv's default `~/.cache/uv` is write-denied there. The repo-local `.uv-cache/` is gitignored. On 2026-10-15 the shared `$TMPDIR/uv-cache` held a `pytest` entry whose files had disappeared, which made installs fail with `failed to open file … WHEEL`.
