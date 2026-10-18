@@ -168,13 +168,17 @@ def error_message(status: int, body: bytes) -> str:
         detail = json.loads(body.decode("utf-8")).get("detail")
     except (ValueError, AttributeError):
         pass
+    code = ""
     if isinstance(detail, dict):
+        code = str(detail.get("status") or "")
         text = " ".join(str(detail.get(k)) for k in ("status", "message") if detail.get(k))
     elif isinstance(detail, list):
         text = "; ".join(str(d.get("msg", d)) if isinstance(d, dict) else str(d) for d in detail)
     else:
         text = body.decode("utf-8", "replace")[:300]
-    hint = {401: " (key rejected or lacks the text_to_speech permission)",
+    # ElevenLabs' own status names the cause; the HTTP code does not (a key's credit cap comes back as 401).
+    hint = {"quota_exceeded": " (not enough credits: the key's credit limit or the plan's quota is too low)"}.get(code) \
+        or {401: " (key rejected or lacks the text_to_speech permission)",
             402: " (out of credits?)", 429: " (rate limited)"}.get(status, "")
     return f"HTTP {status}{hint}: {text}".rstrip(": ")
 

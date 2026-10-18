@@ -54,7 +54,7 @@ After that, `/explainer-video <topic>` runs the skill.
 ## Build and Test
 
 ```bash
-UV_CACHE_DIR="$PWD/.uv-cache" uv run --group dev pytest -q      # 116 passed; four tests need ffmpeg
+UV_CACHE_DIR="$PWD/.uv-cache" uv run --group dev pytest -q      # 117 passed; four tests need ffmpeg
 ```
 
 Inside the sandbox, `UV_CACHE_DIR` must point somewhere writable: uv's default `~/.cache/uv` is write-denied there. The repo-local `.uv-cache/` is gitignored. On 2026-10-15 the shared `$TMPDIR/uv-cache` held a `pytest` entry whose files had disappeared, which made installs fail with `failed to open file … WHEEL`.

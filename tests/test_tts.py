@@ -225,6 +225,14 @@ def test_error_message_reads_detail_and_adds_hint():
     assert tts.error_message(500, b"<html>oops") == "HTTP 500: <html>oops"
 
 
+def test_error_message_hint_follows_the_elevenlabs_status_before_the_http_code():
+    message = ("This request exceeds your API key (explainer-video) quota of 10. "
+               "You have 10 credits remaining, while 68 credits are required for this request.")
+    body = json.dumps({"detail": {"status": "quota_exceeded", "message": message}}).encode()
+    assert tts.error_message(401, body) == (
+        "HTTP 401 (not enough credits: the key's credit limit or the plan's quota is too low): quota_exceeded " + message)
+
+
 # ---------- check ----------
 
 
