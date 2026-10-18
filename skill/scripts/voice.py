@@ -363,8 +363,12 @@ def assemble(out: Path, scene_files: list[Path], narration: Narration) -> dict:
     out.parent.mkdir(parents=True, exist_ok=True)
     concat_list = timeline_dir.parent / "concat.txt"
     concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in scene_files), encoding="utf-8")
+    # A scene's audio ends with its last say() while the picture runs on. Copied as is, each gap is bridged
+    # by one stretched frame, which Apple's players play as 20 ms: the voice runs ahead and cuts off.
+    # Re-encoding the audio once fills every gap with real silence; the video is still copied.
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-                    "-c", "copy", "-movflags", "+faststart", str(out)], check=True)
+                    "-c:v", "copy", "-af", "aresample=async=1:first_pts=0", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart", str(out)], check=True)
 
     used = {entry["id"] for timeline in scenes for entry in timeline}
     cues = place_cues(list(zip(scene_offsets(durations), scenes)),

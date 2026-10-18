@@ -349,6 +349,31 @@ def test_assemble_joins_scenes_and_offsets_subtitles(tmp_path):
 
 
 @pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="needs ffmpeg")
+def test_assemble_fills_the_audio_gap_where_a_scene_outlasts_its_narration(tmp_path):
+    # Apple's players ignore a frame stretched over a gap and play the frames back to back,
+    # so the voice runs ahead of the picture and cuts off: the gap must hold real silence.
+    narration = voice.Narration.load(write_manifest(tmp_path))
+    scenes = []
+    for name in ("Intro", "Outro"):
+        path = tmp_path / f"{name}.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=15:d=1",
+                        "-f", "lavfi", "-i", "sine=d=0.4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", str(path)], check=True)
+        narration.timeline.directory.mkdir(parents=True, exist_ok=True)
+        (narration.timeline.directory / f"{name}.json").write_text(
+            json.dumps({"segments": [{"id": "s01", "start": 0.0}]}))
+        scenes.append(path)
+
+    voice.assemble(tmp_path / "video.mp4", scenes, narration)
+
+    frames = [float(line.split(",")[0]) for line in subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "packet=duration_time",
+         "-of", "csv=p=0", str(tmp_path / "video.mp4")], capture_output=True, text=True, check=True).stdout.split()]
+    assert max(frames[:-1]) == pytest.approx(frames[0])
+    assert 1.4 - frames[0] <= len(frames) * frames[0] < 2.0  # Outro's sound sits after Intro's full second
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="needs ffmpeg")
 def test_assemble_refuses_a_scene_without_audio(tmp_path):
     silent = tmp_path / "Silent.mp4"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=15:d=1",
