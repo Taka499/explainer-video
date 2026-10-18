@@ -52,6 +52,11 @@
 
   Each guard has a test that fails when the guard is removed. The cost is a new restriction: `narration.json` must sit under `~/Movies/explainers`.
 
+### First real run (session 2026-10-18)
+
+- **`assemble` copies the video but re-encodes the audio once.** In a rendered scene the audio track ends with the last `say()`, while the picture holds and clears for another second or so. Joined with `-c copy`, each of those gaps was bridged by one stretched AAC frame: 21 ms of sound labelled as lasting 1.2–1.3 s. ffmpeg honours that label, so every ffmpeg-based check passed. Apple's decoder ignores it and plays the frames back to back, so in the first video (`how-oauth-works`) the user heard the voice cut off. `aresample=async=1` and one AAC encode fill the gaps with real silence, and the user confirmed the re-encoded file plays correctly. A test asserts that the joined audio has no stretched frame; it fails on the old command.
+- **ffmpeg cannot see that fault; AVFoundation can.** Decoding the file with `AVAssetReader` gave 50.3 s of continuous audio for a 55.8 s picture. That decode is how the fault was found, and it is the check to repeat whenever the join changes.
+
 ## Measured (2026-10-15, Darwin 25.6, uv 0.12.23, inside the Claude Code sandbox)
 
 - uv's default cache `~/.cache/uv` is write-denied (`Failed to initialize cache`). Set `UV_CACHE_DIR` to a writable path.
