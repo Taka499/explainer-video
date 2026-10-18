@@ -29,6 +29,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -214,10 +215,16 @@ def read_key(run: Runner = subprocess.run) -> str:
 
 def load_config(root: Path) -> Config:
     path = root / "config.json"
-    if not path.is_file():
-        raise UserError(f"{path} does not exist; it needs at least {{\"voice_id\": \"...\"}}")
     try:
-        return parse_config(json.loads(path.read_text(encoding="utf-8")))
+        with SafeDir.open(root, root) as home:
+            data = home.read("config.json") if home.is_file("config.json") else None
+    except (OSError, UserError):
+        data = None
+    if data is None:
+        raise UserError(f"{path} does not exist or is not a regular file; "
+                        "it needs at least {\"voice_id\": \"...\"}")
+    try:
+        return parse_config(json.loads(data.decode("utf-8")))
     except ValueError as exc:
         raise UserError(f"{path} is not valid JSON: {exc}") from exc
 
@@ -246,24 +253,33 @@ def post_tts(key: str, config: Config, body: dict,
     raise AssertionError("unreachable")
 
 
-def probe_duration(path: Path, run: Runner = subprocess.run) -> float:
-    result = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                  "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-                 capture_output=True, text=True)
+def probe_duration(audio: bytes, run: Runner = subprocess.run) -> float:
+    """ffprobe a private copy. A path under the output root could become a link before ffprobe opens it;
+    a fresh mkdtemp directory under the unsandboxed $TMPDIR is out of the sandbox's reach.
+    (ffprobe cannot read the duration from a pipe: it reports N/A.)"""
+    with tempfile.TemporaryDirectory(prefix="tts-probe-") as private:
+        path = os.path.join(private, "segment.mp3")
+        with open(path, "xb") as f:
+            f.write(audio)
+        result = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                      "-of", "default=noprint_wrappers=1:nokey=1", path],
+                     capture_output=True, text=True)
     try:
         return float(result.stdout.strip())
     except ValueError:
-        raise UserError(f"ffprobe could not read the duration of {path}: {result.stderr.strip()}") from None
+        raise UserError(f"ffprobe could not read the duration of the synthesized audio: "
+                        f"{result.stderr.strip()}") from None
 
 
 class SafeDir:
     """A directory under the output root, opened one component at a time without following symlinks.
 
-    tts.py runs outside the sandbox, yet it writes where sandboxed commands can plant links.
-    Every write therefore goes through this pinned descriptor. A link at any level is refused,
-    and temp files get unpredictable names created with O_EXCL. A planted link can never
-    redirect a write outside the output root. The root itself is trusted: its parent
-    (~/Movies) is not writable inside the sandbox, so the root cannot be swapped for a link.
+    tts.py runs outside the sandbox, yet it reads and writes where sandboxed commands can plant links.
+    Every read and write therefore goes through this pinned descriptor, and no subprocess is handed
+    a path under the root. A link at any level is refused, and temp files get unpredictable names
+    created with O_EXCL. A planted link can never redirect a read or a write outside the output root.
+    The root itself is trusted: its parent (~/Movies) is not writable inside the sandbox, so the root
+    cannot be swapped for a link.
     """
 
     def __init__(self, fd: int, path: Path):
@@ -276,7 +292,8 @@ class SafeDir:
         try:
             parts = real.relative_to(root_real).parts
         except ValueError:
-            raise UserError(f"{directory} is outside {root_real}; tts.py writes only under the output root") from None
+            raise UserError(f"{directory} is outside {root_real}; "
+                            "tts.py reads and writes only under the output root") from None
         fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
         try:
             for part in parts:
@@ -290,7 +307,7 @@ class SafeDir:
                 fd = next_fd
         except OSError as exc:
             os.close(fd)
-            raise UserError(f"refusing to write in {directory}: {exc.strerror} at {part!r} "
+            raise UserError(f"refusing to use {directory}: {exc.strerror} at {part!r} "
                             "(a symlink, or not a directory)") from None
         return cls(fd, real)
 
@@ -344,17 +361,17 @@ def synthesize(narration_path: Path, root: Path, *, run: Runner = subprocess.run
     out = sys.stdout if out is None else out
     if not narration_path.is_absolute():
         raise UserError("pass narration.json as an absolute path ($TMPDIR differs inside and outside the sandbox)")
-    try:
-        raw = json.loads(narration_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise UserError(f"cannot read {narration_path}: {exc}") from exc
-    segments = parse_narration(raw)
-    config = load_config(root)
     sandboxed = in_sandbox() if sandboxed is None else sandboxed
-    with SafeDir.open(root, narration_path.parent) as workdir, \
-            SafeDir.open(root, root / ".cache" / "tts", create=True) as cache:
-        summary = _synthesize_into(segments, raw, config, workdir, cache, run=run, opener=opener,
-                                   sleep=sleep, sandboxed=sandboxed, out=out)
+    with SafeDir.open(root, narration_path.parent) as workdir:
+        try:
+            raw = json.loads(workdir.read(narration_path.name).decode("utf-8"))
+        except (OSError, ValueError) as exc:
+            raise UserError(f"cannot read {narration_path}: {exc}") from exc
+        segments = parse_narration(raw)
+        config = load_config(root)
+        with SafeDir.open(root, root / ".cache" / "tts", create=True) as cache:
+            summary = _synthesize_into(segments, raw, config, workdir, cache, run=run, opener=opener,
+                                       sleep=sleep, sandboxed=sandboxed, out=out)
     print(json.dumps(summary, ensure_ascii=False), file=out)
     return summary
 
@@ -383,7 +400,7 @@ def _synthesize_into(segments: list[Segment], raw: dict, config: Config, workdir
                 "key": digest, "text": seg.text, "voice_id": config.voice_id,
                 "model_id": config.model_id, "output_format": config.output_format,
                 "voice_settings": config.voice_settings,
-                "duration": probe_duration(cache.path / f"{digest}.mp3", run),
+                "duration": probe_duration(audio, run),
                 "alignment_source": source, "alignment": alignment,
                 "billed_characters": cost,
                 "request_id": {k.lower(): v for k, v in headers.items()}.get("request-id"),
