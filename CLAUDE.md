@@ -30,19 +30,44 @@ A Claude Code user-level skill, `explainer-video`, that turns a topic into a 3Bl
 
 ## Architecture
 
-<!-- Describe the high-level structure: key directories, how components relate, data flow. Name the main entry points. -->
+`skill/` is the whole installed skill. `install.sh` links it to `~/.claude/skills/explainer-video`.
+
+- `skill/SKILL.md` runs in the main session: preflight, then the brief, then the launch of one background `general-purpose` Agent, then the report.
+- `skill/references/production.md` is the subagent's manual: storyboard → `narration.json` → `tts.py` → `scenes.py` → low-quality render and still-frame check → final render → `voice.py assemble`.
+- `skill/scripts/tts.py` uses only the standard library and must run on Apple's `/usr/bin/python3` 3.9. It reads the key from the Keychain and calls ElevenLabs `POST /v1/text-to-speech/{voice_id}/with-timestamps`. It caches `<hash>.mp3` and `<hash>.json` (character timing) under `~/Movies/explainers/.cache/tts/`, and writes `voice_manifest.json` beside the narration. It is the only command that runs outside the sandbox (per `docs/plans/0001-explainer-video-skill.md` § Decision Log). It still writes where sandboxed commands can plant symlinks, so all of its writes go through `SafeDir`. `SafeDir` refuses any directory outside the output root, opens each path component with `O_NOFOLLOW`, creates temp files with random names and `O_EXCL`, and renames them in place. Keep every new write on that path.
+- `skill/scripts/voice.py` is copied into each work directory and imported by the scenes. `narration.say(scene, id)` adds the audio and records its start in `build/timeline/<Scene>.json`; `assemble` joins the scene files and writes the SRT from those timelines. It copies the video but re-encodes the audio, so that the gap after each scene's last line holds real silence: Apple's players play a stream-copied join with the voice running ahead and cutting off (per `docs/plans/0001-explainer-video-skill.md` § First real run). It never imports Manim, so its rules test without it.
+- `skill/scripts/toolchain.sh` has three commands. `check` is the preflight. `setup` builds the Manim 0.22.0 venv in `~/Movies/explainers/.toolchain/venv`. `run` sets `PATH`, `XDG_CACHE_HOME` and `TEXMFVAR` so Manim and TeX work inside the sandbox.
+
+The output root `~/Movies/explainers` is overridable with `EXPLAINER_HOME` in every script, so tests and trials can point at a scratch directory.
 
 ## Setup and Development
 
-<!-- How to install dependencies, configure the environment, and run the project locally. Include exact commands. -->
+The user does this once:
+
+1. `brew install pkgconf && brew install --cask mactex-no-gui`.
+2. Store the key, in the user's own terminal: `security add-generic-password -a "$USER" -s elevenlabs-api-key -w`.
+3. In `~/.claude/settings.json`, add `"~/Movies/explainers"` to `sandbox.filesystem.allowWrite`, and allow `tts.py` in `permissions.allow`. `install.sh` prints the exact rule strings.
+4. Run `./install.sh` outside the sandbox, then `~/.claude/skills/explainer-video/scripts/toolchain.sh setup` and `… check`.
+
+After that, `/explainer-video <topic>` runs the skill.
 
 ## Build and Test
 
-<!-- List the commands to build, test, lint, and format. Show expected output for a clean run. -->
+```bash
+UV_CACHE_DIR="$PWD/.uv-cache" uv run --group dev pytest -q      # 117 passed; four tests need ffmpeg
+```
+
+Inside the sandbox, `UV_CACHE_DIR` must point somewhere writable: uv's default `~/.cache/uv` is write-denied there. The repo-local `.uv-cache/` is gitignored. On 2026-10-15 the shared `$TMPDIR/uv-cache` held a `pytest` entry whose files had disappeared, which made installs fail with `failed to open file … WHEEL`.
+
+`tts.py` must also pass under Apple's Python 3.9:
+
+```bash
+UV_CACHE_DIR="$PWD/.uv-cache" uv run --no-project --python /usr/bin/python3 --with pytest pytest -q -p no:cacheprovider tests/test_tts.py
+```
 
 ## Code Style
 
-<!-- Language-specific conventions, naming patterns, import ordering, or formatting tools in use. -->
+Python. Pure rules sit at the top of each script and I/O sits at the edges. Dependencies (subprocess runner, URL opener, sleep, the sandbox flag) are passed in as arguments so that the tests can replace them.
 
 ## Commit Discipline
 

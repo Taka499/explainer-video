@@ -34,6 +34,29 @@
 - **Technical terms on screen stay in English** in every language: the user's rule from the `explainer` skill.
 - **Dropped: a free draft voice (macOS `say`) for previews.** The cache already makes re-renders free.
 
+### Implementation (session 2026-10-15)
+
+- **The voice lives in `~/Movies/explainers/config.json`** (`voice_id`, plus optional `model_id`, `output_format` and `voice_settings`). The preflight asks the user for a voice ID ("Copy voice ID" in the ElevenLabs app) and writes the file. `tts.py` does not list voices, because a key limited to text-to-speech may lack `voices_read`.
+- **`tts.py` writes `voice_manifest.json` beside `narration.json`**, with paths into the cache, and `voice.py` reads only that manifest. The hash function therefore exists in one script.
+- **`tts.py --check` refuses inside the sandbox, which it detects through `SANDBOX_RUNTIME`.** Measured: a sandboxed `security find-generic-password` returns 44 ("could not be found") for any item, so a sandboxed check would report a stored key as missing. A synthesis run whose segments are all cached needs no key and works sandboxed.
+- **Credits come from a response header.** The ElevenLabs docs call it `character-cost` on some pages and `x-character-count` on others. `tts.py` reads either, and falls back to counting characters. The first real call will settle which one it is.
+- **Subtitles come from our own timeline, not Manim's `add_subcaption`.** Each `say()` records when its segment starts in its scene, and `assemble` adds the scene offsets. Per-scene SRTs would need merging after the join anyway, and the timeline stays correct when an animation runs past its audio.
+- **The venv uses Python 3.13.** Every Manim 0.22.0 dependency has a cp313 macOS arm64 wheel except `pycairo`, which builds from source on any Python version. For the `ar` failure under Measured, `setup` exports `AR="$(xcrun --find ar)"`. Measured: inside the sandbox that command prints the right path despite its cache errors. `toolchain.sh run` points `XDG_CACHE_HOME` and `TEXMFVAR` under `.toolchain/`.
+- **`install.sh` prints two spellings of the `tts.py` allow rule**, one with the symlink path and one with its target. It is not known which one `${CLAUDE_SKILL_DIR}` expands to, so the first run will show it, and the other rule can then go.
+- **Risk of that allow rule:** it lets `tts.py` run outside the sandbox with no prompt, and its code sits in this git checkout. A background security review flagged this. The mitigation depends on the sandbox write-protecting files that a symlink in `~/.claude` points to. That is checked after install under Verification.
+- **`tts.py` never writes through a link.** A second background review found that `tts.py`, running outside the sandbox, wrote `voice_manifest.json.part` at a fixed name, in a directory sandboxed commands can write. A link planted there would have sent the write anywhere, `~/.claude/settings.json` for one. All writes now go through `SafeDir`:
+  - It refuses directories that resolve outside the output root.
+  - It walks each path component with `O_NOFOLLOW`, so a link swapped in after the check is refused as well.
+  - It creates temp files with random names and `O_EXCL`, then renames them in place. The rename replaces a planted link and never follows it.
+  - It does not treat a link in the cache as a cached segment.
+
+  Each guard has a test that fails when the guard is removed. The cost is a new restriction: `narration.json` must sit under `~/Movies/explainers`.
+
+### First real run (session 2026-10-18)
+
+- **`assemble` copies the video but re-encodes the audio once.** In a rendered scene the audio track ends with the last `say()`, while the picture holds and clears for another second or so. Joined with `-c copy`, each of those gaps was bridged by one stretched AAC frame: 21 ms of sound labelled as lasting 1.2–1.3 s. ffmpeg honours that label, so every ffmpeg-based check passed. Apple's decoder ignores it and plays the frames back to back, so in the first video (`how-oauth-works`) the user heard the voice cut off. `aresample=async=1` and one AAC encode fill the gaps with real silence, and the user confirmed the re-encoded file plays correctly. A test asserts that the joined audio has no stretched frame; it fails on the old command.
+- **ffmpeg cannot see that fault; AVFoundation can.** Decoding the file with `AVAssetReader` gave 50.3 s of continuous audio for a 55.8 s picture. That decode is how the fault was found, and it is the check to repeat whenever the join changes.
+
 ## Measured (2026-10-15, Darwin 25.6, uv 0.12.23, inside the Claude Code sandbox)
 
 - uv's default cache `~/.cache/uv` is write-denied (`Failed to initialize cache`). Set `UV_CACHE_DIR` to a writable path.
@@ -54,4 +77,5 @@
 - Each unit test is shown to fail when its target is broken (invert or delete the rule, watch it go red, restore).
 - `tts.py --check` reports present or missing without printing the key, both with and without the Keychain item.
 - One 30–60 second topic runs end to end with no input, and the user watches it. Sampled frames from the final MP4 show no overlapping text.
+- After install, a sandboxed write into `skill/` (the symlink's target) is refused. Otherwise the `tts.py` allow rule is an unprompted way out of the sandbox.
 - Open, not documented: a runtime limit for subagents, and what happens to a background subagent's permission prompt that nobody answers.
