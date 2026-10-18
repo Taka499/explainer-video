@@ -2,6 +2,8 @@ import base64
 import email.message
 import io
 import json
+import os
+import signal
 import subprocess
 import urllib.error
 
@@ -351,6 +353,73 @@ def test_narration_outside_the_output_root_is_refused(root, tmp_path):
     with pytest.raises(tts.UserError, match="outside"):
         tts.synthesize(narration, root, run=refuse, opener=refuse, sandboxed=False)
     assert not (tmp_path / "voice_manifest.json").exists()
+
+
+def test_narration_outside_the_root_is_refused_before_it_is_read(root, tmp_path):
+    notes = tmp_path / "notes.json"
+    notes.write_text(json.dumps({"segments": [{"id": "SECRET VALUE", "text": "x"}]}))
+    with pytest.raises(tts.UserError, match="outside") as info:
+        tts.synthesize(notes, root, run=refuse, opener=refuse, sandboxed=False)
+    assert "SECRET" not in str(info.value)
+
+
+def test_narration_linked_to_an_outside_file_is_not_read(root, work, tmp_path):
+    (work / "narration.json").symlink_to(write_narration(tmp_path, SEGMENTS))
+    opener = FakeOpener()
+    with pytest.raises(tts.UserError):
+        tts.synthesize(work / "narration.json", root, run=FakeRunner(), opener=opener, sandboxed=False)
+    assert opener.requests == []
+
+
+def test_config_linked_to_an_outside_file_is_refused(root, tmp_path):
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"voice_id": "theirs"}))
+    (root / "config.json").unlink()
+    (root / "config.json").symlink_to(other)
+    with pytest.raises(tts.UserError, match="not a regular file"):
+        tts.load_config(root)
+
+
+def test_narration_hard_linked_to_an_outside_file_is_not_read(root, work, tmp_path):
+    os.link(write_narration(tmp_path, SEGMENTS), work / "narration.json")
+    opener = FakeOpener()
+    with pytest.raises(tts.UserError, match="single link"):
+        tts.synthesize(work / "narration.json", root, run=FakeRunner(), opener=opener, sandboxed=False)
+    assert opener.requests == []
+
+
+def test_config_hard_linked_to_an_outside_file_is_refused(root, tmp_path):
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"voice_id": "theirs"}))
+    (root / "config.json").unlink()
+    os.link(other, root / "config.json")
+    with pytest.raises(tts.UserError, match="not a regular file"):
+        tts.load_config(root)
+
+
+def test_fifo_in_place_of_the_narration_is_refused_without_blocking(root, work):
+    os.mkfifo(work / "narration.json")
+
+    def blocked(*_):
+        pytest.fail("tts.py blocked opening a FIFO")
+
+    previous = signal.signal(signal.SIGALRM, blocked)
+    signal.alarm(5)
+    try:
+        with pytest.raises(tts.UserError, match="single link"):
+            tts.synthesize(work / "narration.json", root, run=refuse, opener=refuse, sandboxed=False)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_ffprobe_never_gets_a_path_under_the_output_root(root, work):
+    runner = FakeRunner()
+    tts.synthesize(write_narration(work, SEGMENTS), root, run=runner, opener=FakeOpener(), sandboxed=False)
+    probed = [os.path.realpath(c[-1]) for c in runner.calls if c[0] == "ffprobe"]
+    assert len(probed) == 2
+    assert not any(p.startswith(os.path.realpath(root) + os.sep) for p in probed)
+    assert not any(os.path.exists(p) for p in probed)
 
 
 def test_work_directory_linked_outside_the_root_is_refused(root, tmp_path):
