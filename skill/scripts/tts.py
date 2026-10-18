@@ -20,6 +20,7 @@ timing). Standard library only, Python 3.9+ (it may run under the system python3
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -324,7 +325,17 @@ class SafeDir:
             return False
 
     def read(self, name: str) -> bytes:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        """Only a regular file with a single link: a hard link is another name for a file that may sit
+        outside the root, and O_NONBLOCK keeps a planted FIFO from stalling the open."""
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise OSError(errno.EPERM, "not a regular file with a single link", name)
+            os.set_blocking(fd, True)
+        except BaseException:
+            os.close(fd)
+            raise
         with os.fdopen(fd, "rb") as f:
             return f.read()
 

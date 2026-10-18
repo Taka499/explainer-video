@@ -106,7 +106,7 @@ Technical terms on screen stay in English in every narration language. The Claud
 
 `tts.py` is the one command that runs outside the Claude Code sandbox. It has to, because the sandbox cannot read the Keychain. It runs under the allow rule from step 4, with no prompt, so it is written to resist whatever a sandboxed command could plant under `~/Movies/explainers`:
 
-- Every read and write goes through a pinned directory descriptor (`SafeDir`). That refuses links at any level and directories outside the output root.
+- Every read and write goes through a pinned directory descriptor (`SafeDir`). That refuses links at any level and directories outside the output root. It reads only a regular file with a single link, so a hard link or a FIFO planted there is refused too.
 - Temporary files get random names, created with `O_EXCL`.
 - No subprocess is handed a path under the output root.
 - The key is never printed, logged, cached or written.

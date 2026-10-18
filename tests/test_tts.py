@@ -3,6 +3,7 @@ import email.message
 import io
 import json
 import os
+import signal
 import subprocess
 import urllib.error
 
@@ -377,6 +378,39 @@ def test_config_linked_to_an_outside_file_is_refused(root, tmp_path):
     (root / "config.json").symlink_to(other)
     with pytest.raises(tts.UserError, match="not a regular file"):
         tts.load_config(root)
+
+
+def test_narration_hard_linked_to_an_outside_file_is_not_read(root, work, tmp_path):
+    os.link(write_narration(tmp_path, SEGMENTS), work / "narration.json")
+    opener = FakeOpener()
+    with pytest.raises(tts.UserError, match="single link"):
+        tts.synthesize(work / "narration.json", root, run=FakeRunner(), opener=opener, sandboxed=False)
+    assert opener.requests == []
+
+
+def test_config_hard_linked_to_an_outside_file_is_refused(root, tmp_path):
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"voice_id": "theirs"}))
+    (root / "config.json").unlink()
+    os.link(other, root / "config.json")
+    with pytest.raises(tts.UserError, match="not a regular file"):
+        tts.load_config(root)
+
+
+def test_fifo_in_place_of_the_narration_is_refused_without_blocking(root, work):
+    os.mkfifo(work / "narration.json")
+
+    def blocked(*_):
+        pytest.fail("tts.py blocked opening a FIFO")
+
+    previous = signal.signal(signal.SIGALRM, blocked)
+    signal.alarm(5)
+    try:
+        with pytest.raises(tts.UserError, match="single link"):
+            tts.synthesize(work / "narration.json", root, run=refuse, opener=refuse, sandboxed=False)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def test_ffprobe_never_gets_a_path_under_the_output_root(root, work):
